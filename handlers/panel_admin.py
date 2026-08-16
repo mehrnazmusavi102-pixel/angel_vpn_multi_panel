@@ -169,7 +169,7 @@ async def map_vip_cat(callback:types.CallbackQuery):
     await callback.message.edit_text('📦 پلن موردنظر را انتخاب کن. هر پلن می‌تواند به یک instance مستقل نگاشت شود:',reply_markup=vpn_map_vip_plans_keyboard(cid,plans,pid)); await callback.answer()
 
 async def _catalog(callback,state,panel,scope,scope_id,prompt):
-    await callback.answer('⏳ در حال دریافت بسته‌های پنل...'); choices,msg=await panels.get_catalog(panel)
+    await callback.answer('⏳ در حال دریافت Service/Templateهای پنل...'); choices,msg=await panels.get_catalog(panel)
     if not choices:return await callback.message.answer(f'❌ {msg}',reply_markup=vpn_panel_back_keyboard(panel['id']))
     await state.update_data(panel_map_scope=scope,panel_map_scope_id=scope_id,panel_map_panel_id=panel['id'],panel_map_choices=choices)
     await callback.message.answer(prompt,reply_markup=vpn_catalog_pick_keyboard(choices,panel['id']))
@@ -178,25 +178,25 @@ async def _catalog(callback,state,panel,scope,scope_id,prompt):
 async def map_vip_plan(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     _,pid,cid,planid=callback.data.split('|'); p=db.get_vpn_panel(int(pid));
-    if p: await _catalog(callback,state,p,'vip_plan',int(planid),f'یک Template از {_label(p)} را برای این پلن انتخاب کن:')
+    if p: await _catalog(callback,state,p,'vip_plan',int(planid),(f'یک Service از {_label(p)} را برای این پلن انتخاب کن:' if p.get('panel_type') == 'rebecca' else f'یک Template از {_label(p)} را برای این پلن انتخاب کن:'))
 
 @router.callback_query(F.data.startswith('vpnmapcatset|'))
 async def map_category(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     _,pid,cid=callback.data.split('|'); p=db.get_vpn_panel(int(pid));
-    if p: await _catalog(callback,state,p,'vip_category',int(cid),f'یک Template از {_label(p)} را به‌عنوان مقصد پیش‌فرض کل این دسته انتخاب کن:')
+    if p: await _catalog(callback,state,p,'vip_category',int(cid),(f'یک Service از {_label(p)} را به‌عنوان مقصد پیش‌فرض کل این دسته انتخاب کن:' if p.get('panel_type') == 'rebecca' else f'یک Template از {_label(p)} را به‌عنوان مقصد پیش‌فرض کل این دسته انتخاب کن:'))
 
 @router.callback_query(F.data.startswith('vpnmapcustom|'))
 async def map_custom(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     pid=int(callback.data.split('|')[1]); p=db.get_vpn_panel(pid)
-    if p: await _catalog(callback,state,p,'custom_build',0,f'یک Template از {_label(p)} را برای «بساز سرویس خودت» انتخاب کن:')
+    if p: await _catalog(callback,state,p,'custom_build',0,(f'یک Service از {_label(p)} را برای «بساز سرویس خودت» انتخاب کن:' if p.get('panel_type') == 'rebecca' else f'یک Template از {_label(p)} را برای «بساز سرویس خودت» انتخاب کن:'))
 
 @router.callback_query(F.data.startswith('vpnmapfreetest|'))
 async def map_test(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     pid=int(callback.data.split('|')[1]); p=db.get_vpn_panel(pid)
-    if p: await _catalog(callback,state,p,'free_test',0,f'یک Template از {_label(p)} را برای تست رایگان انتخاب کن:')
+    if p: await _catalog(callback,state,p,'free_test',0,(f'یک Service از {_label(p)} را برای تست رایگان انتخاب کن:' if p.get('panel_type') == 'rebecca' else f'یک Template از {_label(p)} را برای تست رایگان انتخاب کن:'))
 
 @router.callback_query(F.data.startswith('vpnmapchoose|'))
 async def map_choose(callback:types.CallbackQuery,state:FSMContext):
