@@ -1,318 +1,326 @@
-"""Rebecca adapter for the current v2 Service-based API.
+"""Rebecca multi-instance adapter.
 
-Authentication:
-- API key entered from the bot admin panel is sent as ``Authorization: Bearer``.
-- Legacy/static header forms are kept as fallbacks for older Rebecca builds.
-
-Current Rebecca master no longer allows manual inbound selection when creating a
-user. A user must belong to a Service; the Service's hosts/inbounds determine the
-resulting subscription/config. Therefore the bot maps plans to Rebecca Service IDs,
-not Templates.
+Current Rebecca (master) uses Bearer API keys and the v2 Service/User API.
+This adapter deliberately does not depend on Templates for Rebecca.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
-_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=10)
-_SESSIONS: dict[int, aiohttp.ClientSession] = {}
-_AUTH: dict[int, dict[str, Any]] = {}
-_SERVICES: dict[int, dict[str, Any]] = {}
-_CAPS: dict[int, dict[str, Any]] = {}
-_LOCK = asyncio.Lock()
+_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=10)
+_sessions = {}
+_auth_cache = {}
+_services_cache = {}
+_lock = asyncio.Lock()
 
 
-def _pid(panel: dict) -> int:
-    return int(panel["id"])
+def _pid(p):
+    return int(p["id"])
 
 
-async def _session(panel: dict) -> aiohttp.ClientSession:
-    pid = _pid(panel)
-    session = _SESSIONS.get(pid)
-    if session and not session.closed:
-        return session
-    async with _LOCK:
-        session = _SESSIONS.get(pid)
-        if not session or session.closed:
-            session = aiohttp.ClientSession(
+def normalize_base_url(raw: str) -> str:
+    """Normalize common URLs copied from the Rebecca dashboard/API docs."""
+    value = (raw or "").strip().strip('"\'`')
+    if not value:
+        return ""
+    if not value.lower().startswith(("http://", "https://")):
+        value = "https://" + value
+    parts = urlsplit(value)
+    path = (parts.path or "").rstrip("/")
+    lower = path.lower()
+    known_suffixes = (
+        "/dashboard",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/api",
+        "/api/v2",
+        "/__rebecca_api/healthz",
+    )
+    for suffix in known_suffixes:
+        if lower == suffix:
+            path = ""
+            break
+    return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
+
+
+def _clean_api_key(value: str) -> str:
+    key = (value or "").strip().strip('"\'`')
+    if key.lower().startswith("authorization:"):
+        key = key.split(":", 1)[1].strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    return key
+
+
+async def _session(p):
+    pid = _pid(p)
+    s = _sessions.get(pid)
+    if s and not s.closed:
+        return s
+    async with _lock:
+        s = _sessions.get(pid)
+        if not s or s.closed:
+            s = aiohttp.ClientSession(
                 timeout=_TIMEOUT,
-                connector=aiohttp.TCPConnector(
-                    limit=20, ttl_dns_cache=300, keepalive_timeout=75
-                ),
+                connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300, keepalive_timeout=75),
             )
-            _SESSIONS[pid] = session
-        return session
+            _sessions[pid] = s
+        return s
 
 
-def _api_key(panel: dict) -> str:
-    return str(panel.get("api_key") or "").strip()
+async def _raw_get(p, path, headers=None, params=None):
+    base = normalize_base_url(p.get("base_url") or "")
+    if not base:
+        return False, None, 0, "Base URL خالی است."
+    try:
+        s = await _session(p)
+        async with s.get(base + path, headers=headers, params=params) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = await r.text()
+            return True, data, r.status, "موفق"
+    except aiohttp.InvalidURL:
+        return False, None, 0, "آدرس Rebecca معتبر نیست."
+    except aiohttp.ClientConnectorError as e:
+        return False, None, 0, f"اتصال به Rebecca برقرار نشد: {e}"
+    except asyncio.TimeoutError:
+        return False, None, 0, "اتصال به Rebecca timeout شد."
+    except Exception as e:
+        logger.exception("Rebecca GET failed")
+        return False, None, 0, f"خطا در ارتباط با Rebecca: {e}"
 
 
-async def _auth_headers(panel: dict, force_refresh: bool = False):
-    """Return the working authentication header(s) for this Rebecca instance.
-
-    Current Rebecca's admin authenticator accepts API keys through the same
-    Bearer authentication path as JWTs, so Bearer is intentionally tried first.
-    X-API-Key/api-key remain compatibility fallbacks for older/custom builds.
-    """
-    pid = _pid(panel)
-    key = _api_key(panel)
-    cache = _AUTH.setdefault(pid, {"mode": None})
-
-    if key:
-        if not force_refresh and cache.get("mode"):
-            return dict(cache["mode"]), None
-        return None, [
-            {"Authorization": f"Bearer {key}"},
-            {"X-API-Key": key},
-            {"api-key": key},
-        ]
-
-    return None, "API Key پنل Rebecca تنظیم نشده است. از پنل ادمین ربات آن را وارد کن."
+async def _auth_headers(p, force_refresh=False):
+    key = _clean_api_key(p.get("api_key") or "")
+    if not key:
+        return None, "API Key برای Rebecca تنظیم نشده است. از بخش ویرایش پنل، API Key را وارد کن."
+    pid = _pid(p)
+    if not force_refresh:
+        cached = _auth_cache.get(pid)
+        if cached and cached.get("key") == key:
+            return {"Authorization": f"Bearer {key}"}, None
+    return {"Authorization": f"Bearer {key}"}, None
 
 
-async def _req(panel: dict, method: str, path: str, json: dict | None = None, params: dict | None = None):
-    auth, err = await _auth_headers(panel)
+async def _req(p, method, path, json=None, params=None, retry_auth=True):
+    headers, err = await _auth_headers(p)
     if err:
         return False, None, err
-
-    base = str(panel.get("base_url") or "").rstrip("/")
+    base = normalize_base_url(p.get("base_url") or "")
     if not base:
-        return False, None, "Base URL پنل Rebecca تنظیم نشده است."
-
-    candidates = auth if isinstance(auth, list) else [auth]
-    last_data = None
-    last_status = None
-
+        return False, None, "Base URL پنل Rebecca خالی یا نامعتبر است."
     try:
-        session = await _session(panel)
-        for headers in candidates:
-            async with session.request(
-                method,
-                f"{base}{path}",
-                json=json,
-                params=params,
-                headers=headers,
-            ) as response:
-                try:
-                    data = await response.json(content_type=None)
-                except Exception:
-                    data = None
-                status = response.status
-
-            last_data, last_status = data, status
-
-            # A 401 means this auth form was rejected; try the next key form.
-            if status == 401:
-                continue
-
-            if status >= 400:
-                detail = data.get("detail") if isinstance(data, dict) else data
-                return False, data, f"خطای Rebecca ({status}): {detail or 'بدون جزئیات'}"
-
-            if _api_key(panel):
-                _AUTH[_pid(panel)]["mode"] = dict(headers)
-            return True, data, "موفق"
-
-        detail = last_data.get("detail") if isinstance(last_data, dict) else last_data
-        return False, last_data, f"احراز هویت Rebecca با API Key ناموفق بود ({last_status or 401}): {detail or 'کلید نامعتبر یا بدون دسترسی لازم'}"
-    except Exception as exc:
+        s = await _session(p)
+        async with s.request(method, base + path, json=json, params=params, headers=headers) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = await r.text()
+            status = r.status
+        if status == 401 and retry_auth:
+            _auth_cache.pop(_pid(p), None)
+            return await _req(p, method, path, json=json, params=params, retry_auth=False)
+        if status >= 400:
+            detail = data.get("detail") if isinstance(data, dict) else data
+            return False, data, f"خطای Rebecca ({status}): {detail or 'بدون جزئیات'}"
+        _auth_cache[_pid(p)] = {"key": _clean_api_key(p.get("api_key") or ""), "at": time.monotonic()}
+        return True, data, "موفق"
+    except aiohttp.InvalidURL:
+        return False, None, "Base URL پنل Rebecca معتبر نیست."
+    except aiohttp.ClientConnectorError as e:
+        return False, None, f"اتصال به Rebecca برقرار نشد: {e}"
+    except asyncio.TimeoutError:
+        return False, None, "درخواست به Rebecca timeout شد."
+    except Exception as e:
         logger.exception("Rebecca request failed: %s %s", method, path)
-        return False, None, f"خطا در ارتباط با Rebecca: {exc}"
+        return False, None, f"خطا در ارتباط با Rebecca: {e}"
 
 
-async def test_connection(panel: dict):
-    # /api/v2/services is a better real-world test because it also verifies that
-    # the API key has permission to read the Service catalog used by mappings.
-    ok, data, msg = await _req(panel, "GET", "/api/v2/services", params={"limit": 1})
-    if ok:
-        return True, data, "اتصال Rebecca و API Key با موفقیت تأیید شد."
-    return False, data, msg
+async def test_connection(p):
+    base = normalize_base_url(p.get("base_url") or "")
+    if not base:
+        return False, None, "❌ Base URL خالی است."
 
-
-async def get_system_stats(panel: dict):
-    return await _req(panel, "GET", "/api/system")
-
-
-async def get_services(panel: dict, force_refresh: bool = False):
-    """Fetch usable Rebecca Services for plan mapping.
-
-    Current Rebecca exposes GET /api/v2/services and returns:
-    {"services": [...], "total": N}.
-    Only services with at least one host are returned because a service without
-    hosts cannot produce a usable subscription/config for a new user.
-    """
-    pid = _pid(panel)
-    cache = _SERVICES.get(pid)
-    now = time.monotonic()
-    if cache and not force_refresh and now < cache["expires_at"]:
-        return True, cache["items"], "موفق (cache)"
-
-    ok, data, msg = await _req(panel, "GET", "/api/v2/services", params={"limit": 200, "offset": 0})
+    # Health endpoint is intentionally unauthenticated in current Rebecca.
+    ok, _, status, msg = await _raw_get(p, "/__rebecca_api/healthz")
     if not ok:
         return False, None, msg
+    if status != 200:
+        return False, None, (
+            f"❌ Base URL اشتباه است یا این آدرس Rebecca نیست (HTTP {status}).\n"
+            f"آدرس صحیح معمولاً ریشه پنل است، مثل:\n{base}\n"
+            "نه /dashboard و نه /api را در انتهای آدرس قرار نده."
+        )
 
-    raw_items = data.get("services", []) if isinstance(data, dict) else data
-    if not isinstance(raw_items, list):
-        return False, None, "پاسخ Serviceهای Rebecca معتبر نیست."
+    ok, data, msg = await _req(p, "GET", "/api/system")
+    if not ok:
+        if "(401)" in msg or "401" in msg:
+            return False, data, "❌ Base URL درست است، اما API Key معتبر نیست یا دسترسی Admin ندارد. API Key را از My Account → API Keys در Rebecca کپی کن."
+        if "(403)" in msg or "403" in msg:
+            return False, data, "❌ API Key معتبر است، اما سطح دسترسی آن برای مدیریت پنل کافی نیست."
+        return False, data, msg
+    return True, data, "✅ اتصال Rebecca و احراز هویت با API Key موفق بود."
 
-    usable = []
-    for item in raw_items:
-        if not isinstance(item, dict) or item.get("id") is None:
-            continue
-        host_count = int(item.get("host_count") or 0)
-        # Broken services or services without hosts cannot create a useful user.
-        if host_count <= 0 or item.get("broken") is True:
-            continue
-        usable.append(item)
 
-    _SERVICES[pid] = {"items": usable, "expires_at": now + 300}
+async def get_system_stats(p):
+    return await _req(p, "GET", "/api/system")
+
+
+async def get_services(p, force_refresh=False):
+    pid = _pid(p)
+    cached = _services_cache.get(pid)
+    if cached and not force_refresh and time.monotonic() < cached["exp"]:
+        return True, cached["items"], "موفق (cache)"
+
+    services = []
+    offset = 0
+    total = None
+    try:
+        for _ in range(20):
+            ok, data, msg = await _req(
+                p,
+                "GET",
+                "/api/v2/services",
+                params={"offset": offset, "limit": 100},
+            )
+            if not ok:
+                return False, None, msg
+            if not isinstance(data, dict):
+                return False, None, "پاسخ Serviceهای Rebecca معتبر نیست."
+            batch = data.get("services") or []
+            if not isinstance(batch, list):
+                return False, None, "ساختار Serviceهای Rebecca معتبر نیست."
+            services.extend(x for x in batch if isinstance(x, dict))
+            total = data.get("total")
+            if not batch or (total is not None and len(services) >= int(total)) or len(batch) < 100:
+                break
+            offset += len(batch)
+    except Exception as e:
+        logger.exception("Rebecca services list failed")
+        return False, None, f"خطا در دریافت Serviceهای Rebecca: {e}"
+
+    # A Service without hosts cannot produce a useful subscription.
+    usable = [x for x in services if x.get("has_hosts") is not False and int(x.get("host_count") or 0) > 0]
+    _services_cache[pid] = {"items": usable, "exp": time.monotonic() + 300}
     return True, usable, "موفق"
 
 
-async def get_service(panel: dict, service_id: int | str):
-    ok, items, msg = await get_services(panel)
-    if not ok:
-        return False, None, msg
-    wanted = str(service_id)
-    for item in items or []:
-        if str(item.get("id")) == wanted:
-            return True, item, "موفق"
-
-    # Refresh once in case the service was just created/changed in Rebecca.
-    ok, items, msg = await get_services(panel, force_refresh=True)
-    if ok:
-        for item in items or []:
-            if str(item.get("id")) == wanted:
-                return True, item, "موفق"
-    return False, None, f"Service با شناسه {service_id} در Rebecca پیدا نشد یا Host فعال ندارد."
+async def get_service(p, service_id):
+    return await _req(p, "GET", f"/api/v2/services/{int(service_id)}")
 
 
-def _bytes(gb) -> int:
+# Kept for compatibility with older code; Rebecca no longer uses Templates for creation.
+async def get_templates(p, force_refresh=False):
+    return False, [], "Rebecca فعلی برای ساخت سرویس از Service استفاده می‌کند و Template لازم نیست."
+
+
+async def get_template(p, tid):
+    return False, None, "Rebecca فعلی برای ساخت سرویس از Service استفاده می‌کند و Template لازم نیست."
+
+
+def _bytes(gb):
     try:
         value = float(gb or 0)
-    except (TypeError, ValueError):
-        value = 0
-    return int(value * 1024**3) if value > 0 else 0
-
-
-def _expire(days) -> int:
-    try:
-        value = int(days or 0)
-    except (TypeError, ValueError):
-        value = 0
-    return int(time.time()) + value * 86400 if value > 0 else 0
-
-
-def _limit(value) -> int:
-    try:
-        return max(int(value or 0), 0)
-    except (TypeError, ValueError):
+        return int(value * 1024 ** 3) if value > 0 else 0
+    except Exception:
         return 0
 
 
-async def _build_service_user(panel: dict, service_id, username: str, volume_gb=None, days=None, device_limit=None):
-    ok, service, msg = await get_service(panel, service_id)
-    if not ok:
-        return False, None, msg
+def _expire(days):
+    try:
+        return int(time.time()) + int(days) * 86400 if int(days or 0) > 0 else 0
+    except Exception:
+        return 0
 
-    sid = int(service["id"])
-    body: dict[str, Any] = {
+
+async def create_user_from_service(p, service_id, username, device_limit=None):
+    return await create_user_custom(p, service_id, username, None, None, device_limit)
+
+
+async def create_user_custom(p, service_id, username, volume_gb, days, device_limit=None):
+    try:
+        sid = int(service_id)
+    except Exception:
+        return False, None, "Service ID برای Rebecca معتبر نیست."
+    body = {
         "username": username,
         "service_id": sid,
-        "status": "active",
         "data_limit_reset_strategy": "no_reset",
     }
-
     if volume_gb is not None:
         body["data_limit"] = _bytes(volume_gb)
     if days is not None:
         body["expire"] = _expire(days)
-
-    # Rebecca's current API exposes IP-limit rather than the old Marzban
-    # hwid_limit field. Keep the plan's device limit meaningful when possible.
-    # This is deliberately called ip_limit in the Rebecca payload; we do not
-    # falsely claim it is an HWID field.
-    limit = _limit(device_limit)
-    if limit > 0:
-        body["ip_limit"] = limit
-
-    # Current master supports both /api/user and /api/v2/users; prefer v2.
-    for path in ("/api/v2/users", "/api/user"):
-        ok, data, msg = await _req(panel, "POST", path, json=body)
-        if ok:
-            return True, data, msg
-        # 404/405 is naturally handled by trying the compatibility endpoint;
-        # validation/auth errors are returned immediately by _req.
-        if isinstance(data, dict) and data.get("detail") and "not found" not in str(data.get("detail")).lower():
-            if "405" not in msg and "404" not in msg:
-                return False, data, msg
-
-    return False, data, msg
-
-
-async def create_user_from_template(panel: dict, template_id, username: str, device_limit=None):
-    """Compatibility alias: remote_ref is treated as a Rebecca Service ID."""
-    return await _build_service_user(panel, template_id, username, None, None, device_limit)
+    if device_limit not in (None, 0, "0"):
+        # Rebecca's current v2 API exposes IP limit, not the old HWID field.
+        body["ip_limit"] = int(device_limit)
+    ok, data, msg = await _req(p, "POST", "/api/v2/users", json=body)
+    if ok:
+        return True, data, msg
+    # Compatibility fallback for older Rebecca builds that expose only /api/user.
+    if data is not None and "(404)" not in msg:
+        return False, data, msg
+    legacy = {
+        "username": username,
+        "service_id": sid,
+        "data_limit_reset_strategy": "no_reset",
+    }
+    if volume_gb is not None:
+        legacy["data_limit"] = _bytes(volume_gb)
+    if days is not None:
+        legacy["expire"] = _expire(days)
+    if device_limit not in (None, 0, "0"):
+        legacy["ip_limit"] = int(device_limit)
+    return await _req(p, "POST", "/api/user", json=legacy)
 
 
-async def create_user_custom(panel: dict, template_id, username: str, volume_gb, days, device_limit=None):
-    """Compatibility alias: remote_ref is treated as a Rebecca Service ID."""
-    return await _build_service_user(panel, template_id, username, volume_gb, days, device_limit)
+async def get_user(p, username):
+    return await _req(p, "GET", f"/api/user/{username}")
 
 
-async def get_user(panel: dict, username: str):
-    return await _req(panel, "GET", f"/api/user/{username}")
+async def renew_user(p, username, service_id, device_limit=None):
+    # Service ID is the mapping reference; renewal only changes quota/time.
+    return await renew_user_custom(p, username, None, None, device_limit=device_limit)
 
 
-async def renew_user(panel: dict, username: str, service_id, device_limit=None):
-    # Service assignment is preserved on update. The mapping is validated so a
-    # stale mapping cannot silently renew a user against a deleted Service.
-    ok, _, msg = await get_service(panel, service_id)
-    if not ok:
-        return False, None, msg
-    return await renew_user_custom(panel, username, None, None, device_limit)
-
-
-async def renew_user_custom(panel: dict, username: str, volume_gb=None, days=None, device_limit=None):
-    body: dict[str, Any] = {}
+async def renew_user_custom(p, username, volume_gb, days, device_limit=None):
+    body = {}
     if volume_gb is not None:
         body["data_limit"] = _bytes(volume_gb)
     if days is not None:
         body["expire"] = _expire(days)
-    limit = _limit(device_limit)
-    if limit > 0:
-        body["ip_limit"] = limit
-    return await _req(panel, "PUT", f"/api/v2/users/{username}", json=body) if body else await get_user(panel, username)
+    if device_limit not in (None, 0, "0"):
+        body["ip_limit"] = int(device_limit)
+    if not body:
+        return False, None, "هیچ مقدار جدیدی برای تمدید Rebecca تعیین نشده است."
+    return await _req(p, "PUT", f"/api/v2/users/{username}", json=body)
 
 
-async def disable_user(panel: dict, username: str):
-    # Rebecca exposes user mutation actions under /api/user/{username}/...
-    return await _req(panel, "PUT", f"/api/user/{username}", json={"status": "disabled"})
+async def disable_user(p, username):
+    return await _req(p, "PUT", f"/api/user/{username}", json={"status": "disabled"})
 
 
-async def enable_user(panel: dict, username: str):
-    return await _req(panel, "PUT", f"/api/user/{username}", json={"status": "active"})
+async def enable_user(p, username):
+    return await _req(p, "PUT", f"/api/user/{username}", json={"status": "active"})
 
 
-async def revoke_sub(panel: dict, username: str):
-    for path in (f"/api/user/{username}/revoke_sub", f"/api/user/{username}/revoke"):
-        ok, data, msg = await _req(panel, "POST", path)
-        if ok:
-            return ok, data, msg
-    return False, data, msg
+async def revoke_sub(p, username):
+    return await _req(p, "POST", f"/api/user/{username}/revoke_sub")
 
 
-async def delete_user(panel: dict, username: str):
-    return await _req(panel, "DELETE", f"/api/user/{username}")
+async def delete_user(p, username):
+    return await _req(p, "DELETE", f"/api/user/{username}")
 
 
-def extract_link_and_username(panel: dict, data):
+def extract_link_and_username(p, data):
     if not isinstance(data, dict):
         return None, None
     link = (
@@ -322,5 +330,4 @@ def extract_link_and_username(panel: dict, data):
         or data.get("sub")
         or data.get("link")
     )
-    # Current Rebecca may return a UserDetail with subscription_url plus username.
     return link, data.get("username")
