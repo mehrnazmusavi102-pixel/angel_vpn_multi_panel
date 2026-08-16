@@ -1271,7 +1271,7 @@ def vpn_catalog_pick_keyboard(choices,panel_id):
 def admin_rebecca_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔌 تست اتصال Rebecca", callback_data="rebeccatest", style="primary")],
-        [InlineKeyboardButton(text="🖥 مدیریت نمونه‌های Rebecca", callback_data="admin_vpn_panels", style="primary")],
+        [InlineKeyboardButton(text="🦋 مشاهده Serviceهای Rebecca", callback_data="rebecca_templates", style="primary")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_back", style="primary")],
     ])
 
