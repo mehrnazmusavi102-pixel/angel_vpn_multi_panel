@@ -320,9 +320,35 @@ async def delete_user(p, username):
     return await _req(p, "DELETE", f"/api/user/{username}")
 
 
+def _absolute_subscription_url(p, link):
+    """Turn Rebecca's relative subscription path into an absolute URL."""
+    if not isinstance(link, str):
+        return None
+
+    link = link.strip()
+    if not link:
+        return None
+
+    # Rebecca may already return a complete URL.
+    if link.lower().startswith(("http://", "https://")):
+        return link
+
+    base = normalize_base_url((p or {}).get("base_url") or "")
+    if not base:
+        return link
+
+    # Handle protocol-relative URLs too.
+    if link.startswith("//"):
+        scheme = urlsplit(base).scheme or "https"
+        return f"{scheme}:{link}"
+
+    # Handle /sub/... and sub/... without creating a double slash.
+    return f"{base.rstrip('/')}/{link.lstrip('/')}"
+
 def extract_link_and_username(p, data):
     if not isinstance(data, dict):
         return None, None
+
     link = (
         data.get("subscription_url")
         or data.get("subscription")
@@ -330,4 +356,22 @@ def extract_link_and_username(p, data):
         or data.get("sub")
         or data.get("link")
     )
-    return link, data.get("username")
+
+    # Be tolerant of wrapped Rebecca responses.
+    username = data.get("username")
+    if not link:
+        for key in ("user", "data", "result"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                link = (
+                    nested.get("subscription_url")
+                    or nested.get("subscription")
+                    or nested.get("sub_url")
+                    or nested.get("sub")
+                    or nested.get("link")
+                )
+                username = username or nested.get("username")
+                if link:
+                    break
+
+    return _absolute_subscription_url(p, link), username
