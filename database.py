@@ -530,6 +530,12 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+    # Migration for installations where vpn_panels was created before API-key support.
+    try:
+        cur.execute("ALTER TABLE vpn_panels ADD COLUMN api_key TEXT")
+    except Exception:
+        pass
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS panel_plan_map (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
