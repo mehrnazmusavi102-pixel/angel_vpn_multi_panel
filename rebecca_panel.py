@@ -6,7 +6,7 @@ import asyncio, logging, time
 import aiohttp
 logger=logging.getLogger(__name__)
 _TIMEOUT=aiohttp.ClientTimeout(total=20,connect=10)
-_tokens={}; _sessions={}; _caps={}; _templates={}; _lock=asyncio.Lock()
+_tokens={}; _sessions={}; _caps={}; _templates={}; _auto_profiles={}; _lock=asyncio.Lock()
 
 def _pid(p): return int(p['id'])
 async def _session(p):
@@ -69,8 +69,77 @@ async def get_template(p,tid):
         for x in items:
             if isinstance(x,dict) and str(x.get('id'))==str(tid): return True,x,'موفق'
     return False,None,f'تمپلیت Rebecca با شناسه {tid} پیدا نشد.'
+
+async def _inbound_paths(p):
+    """Discover Rebecca inbound-list endpoints from its live OpenAPI document."""
+    paths=[]
+    ok,spec,_=await _req(p,'GET','/openapi.json')
+    if ok and isinstance(spec,dict):
+        for path,methods in (spec.get('paths') or {}).items():
+            if 'inbound' not in str(path).lower() or not isinstance(methods,dict): continue
+            if 'get' in methods: paths.append(path)
+    # Compatibility fallbacks for older Rebecca/Marzban-derived builds.
+    for path in ('/api/inbounds','/api/inbounds/simple','/api/core/inbounds'):
+        if path not in paths: paths.append(path)
+    return paths
+
+async def get_auto_profile(p, force_refresh=False):
+    """Build a template-like profile directly from Rebecca inbounds.
+
+    This is the fallback used when the Rebecca instance has no user templates.
+    Existing Template-based installations continue to use their original flow.
+    """
+    pid=_pid(p); cached=_auto_profiles.get(pid)
+    if cached and not force_refresh and time.monotonic()<cached['exp']:
+        return True,cached['profile'],'موفق (cache)'
+
+    last=(False,None,'Inboundهای Rebecca برای ساخت خودکار پیدا نشد.')
+    for path in await _inbound_paths(p):
+        ok,d,m=await _req(p,'GET',path); last=(ok,d,m)
+        if not ok: continue
+        raw=d
+        if isinstance(d,dict):
+            raw=d.get('items') or d.get('inbounds') or d.get('data') or d.get('results') or d
+        if isinstance(raw,dict): raw=list(raw.values())
+        if not isinstance(raw,list): continue
+
+        inbounds={}
+        for x in raw:
+            if not isinstance(x,dict): continue
+            tag=(x.get('tag') or x.get('name') or x.get('inbound_tag') or x.get('remark') or x.get('id'))
+            protocol=str(x.get('protocol') or x.get('type') or '').lower()
+            if not tag: continue
+            if protocol not in ('vless','vmess','trojan','shadowsocks','shadowsocks2022'):
+                for key in ('settings','config','inbound','core_config'):
+                    cfg=x.get(key)
+                    if isinstance(cfg,str):
+                        try:
+                            import json as _json; cfg=_json.loads(cfg)
+                        except Exception:
+                            cfg={}
+                    if isinstance(cfg,dict):
+                        protocol=str(cfg.get('protocol') or cfg.get('type') or '').lower()
+                        if protocol in ('vless','vmess','trojan','shadowsocks','shadowsocks2022'): break
+            if protocol == 'shadowsocks2022': protocol='shadowsocks'
+            if protocol in ('vless','vmess','trojan','shadowsocks'):
+                inbounds.setdefault(protocol,[]).append(str(tag))
+
+        if inbounds:
+            profile={'inbounds':inbounds,'data_limit_reset_strategy':'no_reset'}
+            _auto_profiles[pid]={'profile':profile,'exp':time.monotonic()+300}
+            return True,profile,'ساخت خودکار بر اساس Inboundهای Rebecca'
+    return last
+
+async def get_creation_profile(p,tid=None):
+    """Resolve a normal Template or the special automatic profile."""
+    if tid is not None and str(tid).lower() not in ('auto','__auto__','0','none','null'):
+        return await get_template(p,tid)
+    return await get_auto_profile(p)
+
 def _proxies(t):
-    ins=t.get('inbounds') or {}; return {k:{} for k in ins} or {'vless':{}}
+    ins=t.get('inbounds') or {}
+    if not ins: return {'vless':{}}
+    return {k:{} for k in ins if k in ('vless','vmess','trojan','shadowsocks')} or {'vless':{}}
 def _bytes(gb):
     try:return int(float(gb or 0)*1024**3) if float(gb or 0)>0 else 0
     except:return 0
@@ -78,7 +147,7 @@ def _expire(days):
     try:return int(time.time())+int(days)*86400 if int(days or 0)>0 else 0
     except:return 0
 async def _build(p,tid,username,volume,days,device_limit):
-    ok,t,m=await get_template(p,tid)
+    ok,t,m=await get_creation_profile(p,tid)
     if not ok:return False,None,m
     body={'username':username,'proxies':_proxies(t),'inbounds':t.get('inbounds') or {},'expire':_expire(days) if days is not None else int(time.time())+int(t.get('expire_duration') or 0),'data_limit':_bytes(volume) if volume is not None else int(t.get('data_limit') or 0),'data_limit_reset_strategy':t.get('data_limit_reset_strategy') or 'no_reset'}
     gids=t.get('group_ids');
@@ -93,11 +162,15 @@ async def _build(p,tid,username,volume,days,device_limit):
     return ok,d,m
 async def create_user_from_template(p,tid,username,device_limit=None):
     return await _build(p,tid,username,None,None,device_limit)
+async def create_user_auto(p,username,device_limit=None):
+    return await _build(p,'auto',username,None,None,device_limit)
 async def create_user_custom(p,tid,username,volume_gb,days,device_limit=None):
     return await _build(p,tid,username,volume_gb,days,device_limit)
+async def create_user_custom_auto(p,username,volume_gb,days,device_limit=None):
+    return await _build(p,'auto',username,volume_gb,days,device_limit)
 async def get_user(p,username): return await _req(p,'GET',f'/api/user/{username}')
 async def renew_user(p,username,tid,device_limit=None):
-    ok,t,m=await get_template(p,tid)
+    ok,t,m=await get_creation_profile(p,tid)
     if not ok:return False,None,m
     return await renew_user_custom(p,username,t.get('data_limit'),int((t.get('expire_duration') or 0)/86400),device_limit)
 async def renew_user_custom(p,username,volume_gb,days,device_limit=None):
