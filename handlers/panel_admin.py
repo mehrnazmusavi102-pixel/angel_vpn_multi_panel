@@ -42,7 +42,8 @@ async def panel_detail(callback:types.CallbackQuery):
     if not _is_admin(callback.from_user.id): return
     p=db.get_vpn_panel(int(callback.data.split('|')[1]))
     if not p: await callback.answer('❌ پنل پیدا نشد.',show_alert=True); return
-    await callback.message.edit_text(f"🖥 {_label(p)}\nوضعیت: {'🟢 فعال' if p.get('enabled') else '🔴 غیرفعال'}\n🌐 <code>{html.escape(p.get('base_url') or '')}</code>",parse_mode='HTML',reply_markup=admin_vpn_panel_detail_keyboard(p)); await callback.answer()
+    auth_text = '🔐 API Key' if (p.get('panel_type') == 'rebecca' and p.get('api_key')) else ('👤 نام کاربری / رمز عبور' if p.get('username') else '⚠️ احراز هویت تنظیم نشده')
+    await callback.message.edit_text(f"🖥 {_label(p)}\nوضعیت: {'🟢 فعال' if p.get('enabled') else '🔴 غیرفعال'}\n🌐 <code>{html.escape(p.get('base_url') or '')}</code>\n🔑 روش احراز هویت: {auth_text}",parse_mode='HTML',reply_markup=admin_vpn_panel_detail_keyboard(p)); await callback.answer()
 
 @router.callback_query(F.data.startswith('vpntest|'))
 async def panel_test(callback:types.CallbackQuery):
@@ -94,7 +95,14 @@ async def panel_add_url(message:types.Message,state:FSMContext):
     if not _is_admin(message.from_user.id):return
     v=(message.text or '').strip()
     if not v.startswith(('http://','https://')):return await message.answer('❌ آدرس باید با http:// یا https:// شروع شود.')
-    await state.update_data(new_panel_base_url=v.rstrip('/')); await state.set_state(AdminStates.waiting_panel_username); await message.answer('👤 نام کاربری پنل را بفرست:')
+    d=await state.get_data()
+    await state.update_data(new_panel_base_url=v.rstrip('/'))
+    if d.get('new_panel_type') == 'rebecca':
+        await state.set_state(AdminStates.waiting_panel_api_key)
+        await message.answer('🔐 API Key پنل Rebecca را بفرست:\n\nکلید را دقیقاً همان‌طور که از Rebecca دریافت کرده‌ای ارسال کن.')
+    else:
+        await state.set_state(AdminStates.waiting_panel_username)
+        await message.answer('👤 نام کاربری پنل را بفرست:')
 
 @router.message(AdminStates.waiting_panel_username)
 async def panel_add_user(message:types.Message,state:FSMContext):
@@ -102,6 +110,14 @@ async def panel_add_user(message:types.Message,state:FSMContext):
     v=(message.text or '').strip()
     if not v:return await message.answer('❌ نام کاربری خالی معتبر نیست.')
     await state.update_data(new_panel_username=v); await state.set_state(AdminStates.waiting_panel_password); await message.answer('🔑 رمز عبور پنل را بفرست:')
+
+@router.message(AdminStates.waiting_panel_api_key)
+async def panel_add_api_key(message:types.Message,state:FSMContext):
+    if not _is_admin(message.from_user.id):return
+    v=(message.text or '').strip(); d=await state.get_data()
+    if not v:return await message.answer('❌ API Key خالی معتبر نیست.')
+    pid=db.create_vpn_panel(d['new_panel_type'],d['new_panel_name'],d['new_panel_base_url'],api_key=v)
+    await state.clear(); p=db.get_vpn_panel(pid); await message.answer(f'✅ {_label(p)} اضافه شد.\n\n🔐 احراز هویت با API Key فعال است.',reply_markup=admin_vpn_panel_detail_keyboard(p))
 
 @router.message(AdminStates.waiting_panel_password)
 async def panel_add_pass(message:types.Message,state:FSMContext):
@@ -121,8 +137,10 @@ async def panel_edit_menu(callback:types.CallbackQuery):
 @router.callback_query(F.data.startswith('vpneditfield|'))
 async def panel_edit_field(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
-    _,pid,field=callback.data.split('|'); await state.update_data(edit_panel_id=int(pid),edit_panel_field=field); await state.set_state(AdminStates.waiting_panel_edit_value)
-    await callback.message.answer(f'مقدار جدید {field} را بفرست:'); await callback.answer()
+    _,pid,field=callback.data.split('|'); pid=int(pid); p=db.get_vpn_panel(pid)
+    await state.update_data(edit_panel_id=pid,edit_panel_field=field); await state.set_state(AdminStates.waiting_panel_edit_value)
+    labels={'name':'نام نمونه','base_url':'آدرس پنل','username':'نام کاربری','password':'رمز عبور','api_key':'API Key'}
+    await callback.message.answer(f'مقدار جدید {labels.get(field,field)} را بفرست:'); await callback.answer()
 
 @router.message(AdminStates.waiting_panel_edit_value)
 async def panel_edit_value(message:types.Message,state:FSMContext):
@@ -160,25 +178,25 @@ async def _catalog(callback,state,panel,scope,scope_id,prompt):
 async def map_vip_plan(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     _,pid,cid,planid=callback.data.split('|'); p=db.get_vpn_panel(int(pid));
-    if p: await _catalog(callback,state,p,'vip_plan',int(planid),f'یک مقصد از {_label(p)} را برای این پلن انتخاب کن (در Rebecca می‌تواند ساخت خودکار بدون Template باشد):')
+    if p: await _catalog(callback,state,p,'vip_plan',int(planid),f'یک Template از {_label(p)} را برای این پلن انتخاب کن:')
 
 @router.callback_query(F.data.startswith('vpnmapcatset|'))
 async def map_category(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     _,pid,cid=callback.data.split('|'); p=db.get_vpn_panel(int(pid));
-    if p: await _catalog(callback,state,p,'vip_category',int(cid),f'یک مقصد از {_label(p)} را به‌عنوان مقصد پیش‌فرض کل این دسته انتخاب کن:')
+    if p: await _catalog(callback,state,p,'vip_category',int(cid),f'یک Template از {_label(p)} را به‌عنوان مقصد پیش‌فرض کل این دسته انتخاب کن:')
 
 @router.callback_query(F.data.startswith('vpnmapcustom|'))
 async def map_custom(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     pid=int(callback.data.split('|')[1]); p=db.get_vpn_panel(pid)
-    if p: await _catalog(callback,state,p,'custom_build',0,f'یک مقصد از {_label(p)} را برای «بساز سرویس خودت» انتخاب کن:')
+    if p: await _catalog(callback,state,p,'custom_build',0,f'یک Template از {_label(p)} را برای «بساز سرویس خودت» انتخاب کن:')
 
 @router.callback_query(F.data.startswith('vpnmapfreetest|'))
 async def map_test(callback:types.CallbackQuery,state:FSMContext):
     if not _is_admin(callback.from_user.id):return
     pid=int(callback.data.split('|')[1]); p=db.get_vpn_panel(pid)
-    if p: await _catalog(callback,state,p,'free_test',0,f'یک مقصد از {_label(p)} را برای تست رایگان انتخاب کن:')
+    if p: await _catalog(callback,state,p,'free_test',0,f'یک Template از {_label(p)} را برای تست رایگان انتخاب کن:')
 
 @router.callback_query(F.data.startswith('vpnmapchoose|'))
 async def map_choose(callback:types.CallbackQuery,state:FSMContext):
