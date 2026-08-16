@@ -1231,8 +1231,14 @@ def admin_vpn_panel_delete_confirm_keyboard(panel_id):
 
 def admin_vpn_panel_edit_menu_keyboard(panel):
     pid=panel['id']; rows=[]
-    for field,label in (("name","🏷 نام"),("base_url","🌐 آدرس"),("username","👤 نام کاربری"),("password","🔑 رمز عبور")):
-        if panel.get('panel_type')=='rebecca' and field=='username': pass
+    fields=[("name","🏷 نام"),("base_url","🌐 آدرس")]
+    if panel.get('panel_type')=='rebecca':
+        fields.append(("api_key","🔐 API Key"))
+        # Username/password are intentionally hidden for Rebecca when API-key
+        # auth is used. Legacy rows can still be edited through the database if needed.
+    else:
+        fields.extend([("username","👤 نام کاربری"),("password","🔑 رمز عبور")])
+    for field,label in fields:
         rows.append([InlineKeyboardButton(text=f"{label}", callback_data=f"vpneditfield|{pid}|{field}")])
     rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"vpndetail|{pid}")]); return InlineKeyboardMarkup(inline_keyboard=rows)
 
