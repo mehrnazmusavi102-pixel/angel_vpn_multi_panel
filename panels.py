@@ -12,26 +12,39 @@ async def get_catalog(p):
  c=_client(p)
  if not c:return [],'نوع پنل نامعتبر.'
  ok,data,msg=await c.get_templates(p,force_refresh=True)
- if not ok:return [],msg
- items=data if isinstance(data,list) else []
- out=[]
- for i,x in enumerate(items):
-  if not isinstance(x,dict) or x.get('id') is None:continue
-  ref=str(x['id']); name=x.get('name') or x.get('remark') or f'Template {ref}'; label=f'📦 {name} (id: {ref})'; out.append({'idx':i,'ref':ref,'name':name,'label':label[:60]})
- return (out,'موفق') if out else ([],f'هیچ تمپلیتی در {panel_label(p)} پیدا نشد.')
+ if ok:
+  items=data if isinstance(data,list) else []
+  out=[]
+  for i,x in enumerate(items):
+   if not isinstance(x,dict) or x.get('id') is None:continue
+   ref=str(x['id']); name=x.get('name') or x.get('remark') or f'Template {ref}'; label=f'📦 {name} (id: {ref})'; out.append({'idx':i,'ref':ref,'name':name,'label':label[:60]})
+  if out:return out,'موفق'
+
+ # Rebecca fallback: no Template is required. We expose a virtual mapping entry
+ # and validate that the panel has usable inbounds before showing it.
+ if p.get('panel_type')=='rebecca':
+  aok,profile,amsg=await c.get_auto_profile(p,force_refresh=True)
+  if aok:
+   return ([{'idx':0,'ref':'auto','name':'ساخت خودکار بدون Template','label':'⚙️ ساخت خودکار از Inboundهای Rebecca'}],amsg)
+ return [],msg or f'هیچ تمپلیتی در {panel_label(p)} پیدا نشد.'
 async def create_service(p,username,remote_ref,volume_gb=None,days=None,device_limit=None):
  c=_client(p)
  if not c:return False,None,None,None,'نوع پنل نامعتبر.'
- tid=int(remote_ref)
- if volume_gb is not None or days is not None: ok,data,msg=await c.create_user_custom(p,tid,username,volume_gb,days,device_limit=device_limit)
- else: ok,data,msg=await c.create_user_from_template(p,tid,username,device_limit=device_limit)
+ is_auto=str(remote_ref).lower() in ('auto','__auto__','0','none','null')
+ if p.get('panel_type')=='rebecca' and is_auto:
+  if volume_gb is not None or days is not None: ok,data,msg=await c.create_user_custom_auto(p,username,volume_gb,days,device_limit=device_limit)
+  else: ok,data,msg=await c.create_user_auto(p,username,device_limit=device_limit)
+ else:
+  tid=int(remote_ref)
+  if volume_gb is not None or days is not None: ok,data,msg=await c.create_user_custom(p,tid,username,volume_gb,days,device_limit=device_limit)
+  else: ok,data,msg=await c.create_user_from_template(p,tid,username,device_limit=device_limit)
  if not ok:return False,None,None,data,msg
  link,uid=c.extract_link_and_username(p,data)
  return True,link,uid or username,data,msg
 async def renew_service(p,service_id,remote_ref=None,volume_gb=None,days=None,device_limit=None):
  c=_client(p)
  if not c:return False,None,service_id,None,'نوع پنل نامعتبر.'
- if remote_ref is not None: ok,data,msg=await c.renew_user(p,service_id,int(remote_ref),device_limit=device_limit)
+ if remote_ref is not None and str(remote_ref).lower() not in ('auto','__auto__','0','none','null'): ok,data,msg=await c.renew_user(p,service_id,int(remote_ref),device_limit=device_limit)
  else: ok,data,msg=await c.renew_user_custom(p,service_id,volume_gb,days,device_limit=device_limit)
  if not ok:return False,None,service_id,data,msg
  link,uid=c.extract_link_and_username(p,data); return True,link,uid or service_id,data,msg
