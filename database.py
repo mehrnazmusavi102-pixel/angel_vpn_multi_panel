@@ -1659,13 +1659,38 @@ def update_discount(discount_id: int, **fields):
 
 
 def delete_discount(code: str):
+    """حذف کد تخفیف به همراه سوابق استفاده از آن."""
     with transaction() as cur:
-        cur.execute("DELETE FROM discounts WHERE code = ?", (code.upper(),))
+        code = code.upper()
+
+        # ابتدا سوابق استفاده حذف می‌شوند تا Foreign Key مانع حذف
+        # رکورد اصلی تخفیف نشود.
+        cur.execute(
+            "DELETE FROM discount_usages WHERE discount_id IN "
+            "(SELECT id FROM discounts WHERE code = ?)",
+            (code,),
+        )
+
+        cur.execute(
+            "DELETE FROM discounts WHERE code = ?",
+            (code,),
+        )
 
 
 def delete_discount_by_id(discount_id: int):
+    """حذف کد تخفیف به همراه تمام سوابق استفاده از آن."""
     with transaction() as cur:
-        cur.execute("DELETE FROM discounts WHERE id = ?", (discount_id,))
+        # به دلیل Foreign Key ابتدا رکوردهای وابسته حذف می‌شوند.
+        cur.execute(
+            "DELETE FROM discount_usages WHERE discount_id = ?",
+            (discount_id,),
+        )
+
+        # سپس خود کد تخفیف حذف می‌شود.
+        cur.execute(
+            "DELETE FROM discounts WHERE id = ?",
+            (discount_id,),
+        )
 
 
 # ---------------------------------------------------------------------------
