@@ -11,6 +11,8 @@ import secrets
 import string
 import os
 import json
+import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -26,32 +28,135 @@ from config import (
 
 _local = threading.local()
 _lock = threading.Lock()  # برای جلوگیری از تداخل نوشتن همزمان
+_db_reconnect_lock = threading.Lock()
 _text_overrides_ready = False
 
 # اگر آدرس Turso تنظیم شده باشد، از دیتابیس ابری (دائمی) استفاده می‌کنیم؛
 # در غیر این صورت، از فایل SQLite محلی (مناسب تست روی سیستم شخصی) استفاده می‌شود.
 USE_TURSO = bool(TURSO_DATABASE_URL)
 
+# خطاهای Hrana/libSQL مثل «stream not found» معمولاً به معنی خراب/منقضی شدن
+# session قبلی هستند. در این حالت connection را یک‌بار بازسازی و همان query را
+# دوباره اجرا می‌کنیم تا قطع موقت دیتابیس باعث از کار افتادن کل ربات نشود.
+_RETRYABLE_DB_ERRORS = (
+    "stream not found",
+    "connection reset",
+    "connection closed",
+    "connection aborted",
+    "broken pipe",
+    "server disconnected",
+    "transport endpoint",
+    "timed out",
+    "timeout",
+)
+_DB_RETRY_COUNT = 2
+_DB_RETRY_DELAY = 0.35
+
+
+def _is_retryable_db_error(exc):
+    text = str(exc).lower()
+    return any(marker in text for marker in _RETRYABLE_DB_ERRORS)
+
+
+def _new_raw_connection():
+    if USE_TURSO:
+        import libsql
+        return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+
+    db_dir = os.path.dirname(DATABASE_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -16000")
+    return conn
+
+
+def _replace_connection():
+    """اتصال خراب را با یک connection تازه جایگزین می‌کند، بدون تغییر wrapper."""
+    with _db_reconnect_lock:
+        connection = getattr(_local, "conn", None)
+        raw = _new_raw_connection()
+        if isinstance(connection, ResilientConnection):
+            old_raw = connection._raw
+            connection._raw = raw
+            try:
+                old_raw.close()
+            except Exception:
+                pass
+            logger.info("اتصال دیتابیس بازسازی شد (DB reconnect).")
+            return connection
+
+        _local.conn = ResilientConnection(raw)
+        logger.info("اتصال دیتابیس ساخته شد (DB reconnect).")
+        return _local.conn
+
+
+class ResilientCursor:
+    """Cursor مقاوم در برابر قطع session در Turso/Hrana."""
+
+    def __init__(self, connection):
+        self._connection = connection
+        self._cursor = connection._raw.cursor()
+
+    def execute(self, *args, **kwargs):
+        for attempt in range(_DB_RETRY_COUNT + 1):
+            try:
+                return self._cursor.execute(*args, **kwargs)
+            except Exception as exc:
+                if not USE_TURSO or not _is_retryable_db_error(exc) or attempt >= _DB_RETRY_COUNT:
+                    raise
+                logger.warning(
+                    "خطای موقت دیتابیس هنگام execute؛ تلاش مجدد %s/%s: %s",
+                    attempt + 1, _DB_RETRY_COUNT, exc,
+                )
+                time.sleep(_DB_RETRY_DELAY * (attempt + 1))
+                self._connection = _replace_connection()
+                self._cursor = self._connection._raw.cursor()
+        raise RuntimeError("database execute retry exhausted")
+
+    def executemany(self, *args, **kwargs):
+        for attempt in range(_DB_RETRY_COUNT + 1):
+            try:
+                return self._cursor.executemany(*args, **kwargs)
+            except Exception as exc:
+                if not USE_TURSO or not _is_retryable_db_error(exc) or attempt >= _DB_RETRY_COUNT:
+                    raise
+                logger.warning(
+                    "خطای موقت دیتابیس هنگام executemany؛ تلاش مجدد %s/%s: %s",
+                    attempt + 1, _DB_RETRY_COUNT, exc,
+                )
+                time.sleep(_DB_RETRY_DELAY * (attempt + 1))
+                self._connection = _replace_connection()
+                self._cursor = self._connection._raw.cursor()
+        raise RuntimeError("database executemany retry exhausted")
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class ResilientConnection:
+    """لایه نازک روی connection واقعی؛ برای حفظ API فعلی database.py."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def cursor(self, *args, **kwargs):
+        return ResilientCursor(self)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def close(self):
+        return self._raw.close()
+
 
 def get_connection():
     if not hasattr(_local, "conn"):
-        if USE_TURSO:
-            import libsql
-            conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
-        else:
-            db_dir = os.path.dirname(DATABASE_PATH)
-            if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
-            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA journal_mode = WAL")
-            # 🚀 بهینه‌سازی سرعت: در حالت WAL نیازی به fsync کامل بعد از هر تراکنش نیست (همچنان در برابر کرش برنامه ایمن است، فقط در برابر قطعی برق درسترین لحظه‌های آخر ریسک دارد)، یعنی نوشتن خیلی سریع‌تر.
-            conn.execute("PRAGMA synchronous = NORMAL")
-            # جداول موقت و مرتب‌سازی در RAM به‌جای دیسک (سرعت بیشتر برای کوئری‌های پیچیده/مرتب‌سازی ادمین/جستجو)
-            conn.execute("PRAGMA temp_store = MEMORY")
-            # افزایش کش داخلی SQLite از ~۲مگابایت پیش‌فرض به ~۶۴مگابایت (مقدار منفی یعنی تعداد صفحات ۱۶کیلوبایتی)، تا در جدول‌های پرترافیک (کاربران، سرویس‌ها) کمتر نیاز به خواندن مکرر از دیسک باشد.
-            conn.execute("PRAGMA cache_size = -16000")
-        _local.conn = conn
+        _local.conn = ResilientConnection(_new_raw_connection())
     return _local.conn
 
 
